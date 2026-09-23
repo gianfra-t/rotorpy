@@ -1,3 +1,5 @@
+Note, this is a fork of .... Please read expanding to vtol to get an idea of the objective of the fork.
+
 # RotorPy
 A Python-based multirotor simulation environment with aerodynamic wrenches, useful for education and research in estimation, planning, and control for UAVs.
 <p align="center"><img src="/media/double_pillar.gif" width="32%"/><img src="/media/gusty.gif" width="32%"/><img src="/media/minsnap.gif" width="32%"/></p>
