@@ -1,4 +1,4 @@
-Note, this is a fork of .... Please read expanding to vtol to get an idea of the objective of the fork.
+Note, this is a fork of [rotorpy](https://github.com/spencerfolk/rotorpy) Please read expanding to vtol to get an idea of the objective of the fork.
 
 # RotorPy
 A Python-based multirotor simulation environment with aerodynamic wrenches, useful for education and research in estimation, planning, and control for UAVs.
