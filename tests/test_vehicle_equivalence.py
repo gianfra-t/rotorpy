@@ -1,4 +1,4 @@
-"""MultirotorExtended flies exactly like vanilla Multirotor.
+"""MultirotorExtended and DrakeMultirotor fly like vanilla Multirotor.
 
 The case is the hummingbird example made as hard as vanilla Multirotor can express: a full inertia tensor, every aero term on,
  asymmetric non-planar arms, per-rotor flapping, etc.
@@ -6,12 +6,19 @@ The case is the hummingbird example made as hard as vanilla Multirotor can expre
 Both vehicles fly the same closed loop: SE3Control, on a circle with a vertical oscillation and a yaw sinusoid, in
 a time-varying wind. 
 
-Integrators are tight (DOP853, rtol 1e-11, atol 1e-12), so the tolerance is the integrator floor.
+Integrators are tight (DOP853, rtol 1e-11, atol 1e-12; Drake runge_kutta5 at accuracy 1e-10), so Extended is
+held to the integrator floor.
+
+Drake implementation cannot fly the exact vehicle: a rotor spin joint without inertia is singular, so it carries a tiny rotor
+(J_p = 1e-9 Izz, 1e-6 kg). Its tolerances are set by that rotor, not by the model. Still, it manages to closely follow the vanilla Multirotor's behavior.
 """
 
 import copy
+import importlib.util
+from functools import lru_cache
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from rotorpy.controllers.quadrotor_control import SE3Control
@@ -23,6 +30,8 @@ from rotorpy.trajectories.circular_traj import ThreeDCircularTraj
 from rotorpy.vehicles.hummingbird_params import quad_params as hummingbird_params
 from rotorpy.vehicles.multirotor import Multirotor
 from rotorpy.vehicles.multirotor_extended import MultirotorExtended
+from rotorpy.vehicles.multirotor_params import structured_from_legacy
+from rotorpy.vehicles.drake.multirotor import DrakeMultirotor
 from rotorpy.wind.default_winds import SinusoidWind
 from rotorpy.world import World
 
@@ -33,6 +42,11 @@ TIGHT = {"method": "DOP853", "rtol": 1e-11, "atol": 1e-12}
 TOLERANCE = {"x": 1e-9, "v": 1e-9, "q": 1e-10, "w": 1e-9, "rotor_speeds": 1e-8}
 # command comparisson tolerance, relative to each command's peak (they span 1 for cmd_q to ~850 rad/s)
 COMMAND_RTOL = 1e-10
+# Drake: about 3x the measured tiny-rotor effect (see the module docstring)
+DRAKE = {"integrator": "runge_kutta5", "accuracy": 1e-10}
+DRAKE_TOLERANCE = {"x": 5e-8, "v": 3e-7, "q": 6e-8, "w": 3e-6, "rotor_speeds": 3e-3}
+DRAKE_COMMAND_RTOL = 4e-6
+DRAKE_ROTOR_MASS, DRAKE_ROTOR_JP = 1e-6, 1e-9 * hummingbird_params["Izz"]
 
 # -----------------  the case  --------------------------------------------------------- 
 PARAMS = copy.deepcopy(hummingbird_params)
@@ -65,9 +79,21 @@ INITIAL_STATE = {"x": START["x"], "v": START["x_dot"], "q": np.array([0.0, 0.0, 
                  "rotor_speeds": np.full(4, HOVER_SPEED)}
 
 
-def fly(vehicle_class):
+def make(impl):
+    if impl == "vanilla":
+        return Multirotor(PARAMS, aero=True, integrator_kwargs=TIGHT)
+    if impl == "extended":
+        return MultirotorExtended(PARAMS, aero=True, integrator_kwargs=TIGHT)
+    if impl == "drake":
+        legacy = {**PARAMS, "rotor_inertia": DRAKE_ROTOR_JP}
+        return DrakeMultirotor(structured_from_legacy(legacy, DRAKE_ROTOR_MASS, rotor_frame=True), aero=True, **DRAKE)
+    raise ValueError(impl)
 
-    vehicle = vehicle_class(PARAMS, aero=True, integrator_kwargs=TIGHT)
+
+@lru_cache(maxsize=None)
+def fly(impl):
+
+    vehicle = make(impl)
     np.random.seed(0)  # the IMU and mocap are noisy; they are recorded, never fed back
     time, state, control, flat, *_ = simulate(
         World.empty((-9, 9, -9, 9, -9, 9)), copy.deepcopy(INITIAL_STATE), vehicle, SE3Control(PARAMS),
@@ -78,9 +104,14 @@ def fly(vehicle_class):
     return time, state, control, flat
 
 
-def test_extended_flies_like_vanilla():
-    time, vanilla, commands, flat = fly(Multirotor)
-    extended_time, extended, extended_commands, _ = fly(MultirotorExtended)
+@pytest.mark.parametrize("impl, tolerances, command_rtol", [
+    pytest.param("extended", TOLERANCE, COMMAND_RTOL, id="extended"),
+    pytest.param("drake", DRAKE_TOLERANCE, DRAKE_COMMAND_RTOL, id="drake", marks=pytest.mark.skipif(
+        importlib.util.find_spec("pydrake") is None, reason="DrakeMultirotor needs pydrake")),
+])
+def test_flies_like_vanilla(impl, tolerances, command_rtol):
+    time, vanilla, commands, flat = fly("vanilla")
+    other_time, other, other_commands, _ = fly(impl)
 
     # The flight is hard enough to mean something (~35 deg bank, the speed limit reached on ~14 % of the steps)
     # and still under control (~0.13 m tracking).
@@ -90,9 +121,9 @@ def test_extended_flies_like_vanilla():
     assert np.max(np.linalg.norm(vanilla["x"] - flat["x"], axis=1)) < 0.25
 
     # Same clock. The flat outputs are the trajectory evaluated on it, so they need no comparison of their own.
-    np.testing.assert_array_equal(extended_time, time)
-    for key, tolerance in TOLERANCE.items():
-        np.testing.assert_allclose(extended[key], vanilla[key], rtol=0, atol=tolerance, err_msg=key)
+    np.testing.assert_array_equal(other_time, time)
+    for key, tolerance in tolerances.items():
+        np.testing.assert_allclose(other[key], vanilla[key], rtol=0, atol=tolerance, err_msg=key)
     for key, command in commands.items():
-        bound = COMMAND_RTOL * np.max(np.abs(command))
-        np.testing.assert_allclose(extended_commands[key], command, rtol=0, atol=bound, err_msg=key)
+        bound = command_rtol * np.max(np.abs(command))
+        np.testing.assert_allclose(other_commands[key], command, rtol=0, atol=bound, err_msg=key)
