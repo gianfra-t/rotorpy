@@ -17,7 +17,12 @@ Conventions:
   the airframe is ``+sigma * k_m * Omega*|Omega| * axis``.
 * ``cmd_tilt_torques`` (N*m about each hinge axis) pass through a first-order ``torque_lag`` (s, default 0); the
   applied torque is carried in the state as ``tilt_torques``.
-* NaN commands: a NaN tilt torque is a free hinge, a NaN rotor speed a free rotor (aero drag torque still acts).
+* ``cmd_tilt_rates`` (rad/s about each hinge axis) prescribe rate. its rate follows the command through a
+  first-order ``rate_lag`` (s, default 0.05) and the hinge torque is the one that makes it so, solved like the spin
+  torque.  A hinge takes a torque or a rate, never both. Commanding values for the same hinge raise ``ValueError``.
+  ``tilt_torques`` in the returned state is the torque actually applied at each hinge, solved or commanded.
+* NaN commands: a NaN tilt torque is a free hinge (unless its rate is prescribed), a NaN tilt rate is not prescribed,
+  a NaN rotor speed a free rotor (aero drag torque still acts).
 """
 
 from __future__ import annotations
@@ -152,6 +157,9 @@ class DrakeMultirotor(Multirotor):
         self.torque_lag = np.array([float(spec.get("torque_lag", 0.0)) for spec in specs])
         if not np.all(np.isfinite(self.torque_lag)) or np.any(self.torque_lag < 0.0):
             raise ValueError("torque_lag must be finite and nonnegative")
+        self.rate_lag = np.array([float(spec.get("rate_lag", 0.05)) for spec in specs])
+        if not np.all(np.isfinite(self.rate_lag)) or np.any(self.rate_lag <= 0.0):
+            raise ValueError("rate_lag must be finite and positive")
         self.initial_state = dict(self.initial_state)
         self.initial_state.setdefault("tilt_torques", np.zeros(self.num_assemblies))
         self.total_mass = model["total_mass"]
@@ -317,7 +325,7 @@ class DrakeMultirotor(Multirotor):
             "rotor_speeds": np.array([-s * j.get_angular_rate(ctx) for s, j in zip(self.rotor_directions, self.spin_joints)]),
             "tilt_angles": np.array([j.get_angle(ctx) for j in self.tilt_joints]),
             "tilt_rates": np.array([j.get_angular_rate(ctx) for j in self.tilt_joints]),
-            "tilt_torques": self.effectors.tilt_torques(self.effectors.GetMyContextFromRoot(self.context)),
+            "tilt_torques": self.effectors.applied_tilt_torques(self.effectors.GetMyContextFromRoot(self.context)),
         }
 
     def _commands(self, state, control):
@@ -329,12 +337,18 @@ class DrakeMultirotor(Multirotor):
         else:
             raise ValueError("DrakeMultirotor supports cmd_motor_speeds and cmd_motor_thrusts")
         speeds = np.clip(speeds, self.rotor_speed_min, self.rotor_speed_max)  # NaN passes through
-        tilts = np.asarray(control.get("cmd_tilt_torques", np.zeros(self.num_assemblies)), dtype=float)
-        if speeds.shape != (self.num_rotors,) or tilts.shape != (self.num_assemblies,):
+        k = self.num_assemblies
+        tilts = np.asarray(control.get("cmd_tilt_torques", np.full(k, np.nan)), dtype=float)
+        rates = np.asarray(control.get("cmd_tilt_rates", np.full(k, np.nan)), dtype=float)
+        if speeds.shape != (self.num_rotors,) or tilts.shape != (k,) or rates.shape != (k,):
             raise ValueError("commands must have one value per rotor / per assembly")
-        tilts = np.nan_to_num(tilts, nan=0.0)  # NaN = zero torque = free hinge
+        both = np.flatnonzero(~np.isnan(tilts) & ~np.isnan(rates))
+        if both.size:
+            raise ValueError(f"tilt hinges {both.tolist()} got both cmd_tilt_torques and cmd_tilt_rates; "
+                             "pass NaN for one of them")
+        tilts = np.nan_to_num(tilts, nan=0.0)  # NaN = zero torque = free hinge (or a rate-prescribed one)
         wind = np.asarray(state["wind"], dtype=float)
-        return np.concatenate((tilts, speeds, wind))
+        return np.concatenate((tilts, rates, speeds, wind))
 
     def _load(self, state, control, root=None):
         root = self.context if root is None else root
@@ -420,8 +434,9 @@ class DrakeMultirotor(Multirotor):
 class Effectors(LeafSystem):
     """Tilt torque lag, rotor motors and aerodynamics as continuous feedback.
 
-    Inputs: plant state; commands = [tilt torque cmds (K), rotor speed
-    cmds (N), wind (3)].  Continuous state: applied tilt torques (K).
+    Inputs: plant state; commands = [tilt torque cmds (K), tilt rate cmds
+    (K, NaN = not prescribed), rotor speed cmds (N), wind (3)].  Continuous
+    state: lagged tilt torques (K).
     Outputs: joint actuation (tilt then spin, in actuator order) and the
     aerodynamic ExternallyAppliedSpatialForce list.
     """
@@ -433,7 +448,7 @@ class Effectors(LeafSystem):
         k, n, m = vehicle.num_assemblies, vehicle.num_rotors, vehicle._model
         self._plant_context = plant.CreateDefaultContext()
         self.DeclareVectorInputPort("state", plant.num_multibody_states())
-        self.DeclareVectorInputPort("commands", k + n + 3)
+        self.DeclareVectorInputPort("commands", 2 * k + n + 3)
         self.DeclareVectorOutputPort("actuation", plant.num_actuated_dofs(), self._calc_actuation)
         self.DeclareAbstractOutputPort(
             "spatial_forces",
@@ -443,7 +458,8 @@ class Effectors(LeafSystem):
         self._coeffs = (vehicle.k_eta, vehicle.k_m, vehicle.k_d, vehicle.k_z, vehicle.k_h, vehicle.k_flap,
                         vehicle.rotor_directions, vehicle.drag_matrix, vehicle.aero)
         self._k_m = vehicle.k_m
-        self._spin_rows =np.array([joint.velocity_start() for joint in vehicle.spin_joints], dtype=int)
+        self._tilt_rows = np.array([joint.velocity_start() for joint in vehicle.tilt_joints], dtype=int)
+        self._spin_rows = np.array([joint.velocity_start() for joint in vehicle.spin_joints], dtype=int)
         self._actuation_matrix = plant.MakeActuationMatrix()
         self._lagged = vehicle.torque_lag > 0.0
         self._lag = np.where(self._lagged, vehicle.torque_lag, 1.0)
@@ -460,11 +476,21 @@ class Effectors(LeafSystem):
         command = self.get_input_port(1).Eval(context)[:k]
         return np.where(self._lagged, context.get_continuous_state_vector().CopyToVector(), command)
 
+    def applied_tilt_torques(self, context):
+        """Hinge torques actually applied: the solved ones on rate-prescribed hinges, tilt_torques() elsewhere."""
+
+        return np.asarray(self.get_output_port(0).Eval(context))[: self._v.num_assemblies].copy()
+
     def DoCalcTimeDerivatives(self, context, derivatives):
         k = self._v.num_assemblies
         if k == 0:
             return
-        command = self.get_input_port(1).Eval(context)[:k]
+        cmd = self.get_input_port(1).Eval(context)
+        command, prescribed = cmd[:k], ~np.isnan(cmd[k : 2 * k])
+        if prescribed.any():
+            # The lag state of a rate-prescribed hinge follows the solved torque, so a switch back to a torque
+            # command starts from the torque the hinge was carrying.
+            command = np.where(prescribed, self.applied_tilt_torques(context), command)
         applied = context.get_continuous_state_vector().CopyToVector()
         derivatives.get_mutable_vector().SetFromVector(np.where(self._lagged, (command - applied) / self._lag, 0.0))
 
@@ -499,6 +525,10 @@ class Effectors(LeafSystem):
     def _calc_actuation(self, context, output):
         """Tilt torques, then the spin torques that prescribe each rotor's speed.
 
+        A hinge with a tilt-rate command is prescribed the same way: its rate follows the command through the
+        first-order ``rate_lag`` and its torque is solved for.  Tilt and spin prescriptions are coupled through the
+        mass matrix, so they are solved together.
+
         The rotor speed is prescribed, as in the reference models: Omega (relative to the rotor's parent) follows
         the motor lag exactly, and the spin torque is the constraint torque that makes it so.  Here we are modelling 
         the motor as a rotation joint where a torque must be provided. This is more realistic, but breaks the interface
@@ -506,17 +536,19 @@ class Effectors(LeafSystem):
 
         That's why we need to infer the exact torque that would be required at each spin joint to achieve the commanded
         rotor speed. Acceleration is affine in the actuation, vdot(u0 + du) = vdot(u0) + M^-1 B du, so the spin torque
-        correction solves  S M^-1 B_s du = thetaddot_lag - S vdot(u0)  (S picks the spin rows).
+        correction solves  S M^-1 B_s du = thetaddot_lag - S vdot(u0)  (S picks the prescribed rows).
         """
 
         v = self._v
         ctx = self._sync(context)
         cmd = self.get_input_port(1).Eval(context)
         k, n = v.num_assemblies, v.num_rotors
-        speed_cmd = cmd[k : k + n]
-        tau_tilt = self.tilt_torques(context)
+        rate_cmd, speed_cmd = cmd[k : 2 * k], cmd[2 * k : 2 * k + n]
+        tau_tilt = np.where(np.isnan(rate_cmd), self.tilt_torques(context), 0.0)
+        rate = np.array([joint.get_angular_rate(ctx) for joint in v.tilt_joints])
         speed, sigma = self._rotor_speeds(ctx), v.rotor_directions
-        target = -sigma * (speed_cmd - speed) / v.tau_m
+        # Target joint accelerations, in actuator order (tilt, then spin); NaN where not prescribed.
+        target = np.concatenate(((rate_cmd - rate) / v.rate_lag, -sigma * (speed_cmd - speed) / v.tau_m))
 
         # Predictor: the isolated-rotor torque (lag inertia torque + aero drag couple).  Exact up to the parent's
         # axial acceleration.
@@ -524,11 +556,11 @@ class Effectors(LeafSystem):
                                                                  + self._k_m * speed * np.abs(speed)))
         actuation = np.concatenate((tau_tilt, tau_spin))
         accel = self._acceleration(ctx, actuation, self._spatial_forces(context))
-        prescribed = np.flatnonzero(~np.isnan(speed_cmd))
+        prescribed = np.flatnonzero(~np.isnan(np.concatenate((rate_cmd, speed_cmd))))
         if prescribed.size:
-            rows = self._spin_rows[prescribed]
-            mobility = np.linalg.solve(v.plant.CalcMassMatrix(ctx), self._actuation_matrix[:, k + prescribed])
-            actuation[k + prescribed] += np.linalg.solve(mobility[rows], target[prescribed] - accel[rows])
+            rows = np.concatenate((self._tilt_rows, self._spin_rows))[prescribed]
+            mobility = np.linalg.solve(v.plant.CalcMassMatrix(ctx), self._actuation_matrix[:, prescribed])
+            actuation[prescribed] += np.linalg.solve(mobility[rows], target[prescribed] - accel[rows])
         output.SetFromVector(actuation)
 
     def _acceleration(self, ctx, actuation, forces):
