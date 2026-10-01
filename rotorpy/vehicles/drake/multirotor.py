@@ -1,48 +1,62 @@
-"""
-``DrakeMultirotor`` solves the dynamics using the Multibody physics engine 'Drake'.
-
-The aircraft is modeled as a multibody system (plant), such that supporting tilting
-nacelles in arbitrary configurations is possible. Control commands, forces and moments (wrench)
-are then supplied to the model on each iteration given the current state of the plant.
-
-Rotors are also modeled as separate, spinning rigid bodies connected to their parent (nacelle or airframe)
-via a revolute joint. This allows for gimballed configurations as well (future work).
-
-Conventions:
-
-* Airframe body frame = RotorPy body frame (FLU), world z-up.
-* ``x``/``v`` are the position/velocity of the instantaneous total COM, ``q`` the airframe attitude ``[x, y, z, w]``,
-  ``w`` the airframe body rates.
-* Spin joint rate is ``-sigma * rotor_speed`` (``sigma = rotor_directions``): the sign for which the motor reaction on
-  the airframe is ``+sigma * k_m * Omega*|Omega| * axis``.
-* ``cmd_tilt_torques`` (N*m about each hinge axis) pass through a first-order ``torque_lag`` (s, default 0); the
-  applied torque is carried in the state as ``tilt_torques``.
-* ``cmd_tilt_rates`` (rad/s about each hinge axis) prescribe rate. its rate follows the command through a
-  first-order ``rate_lag`` (s, default 0.05) and the hinge torque is the one that makes it so, solved like the spin
-  torque.  A hinge takes a torque or a rate, never both. Commanding values for the same hinge raise ``ValueError``.
-  ``tilt_torques`` in the returned state is the torque actually applied at each hinge, solved or commanded.
-* NaN commands: a NaN tilt torque is a free hinge (unless its rate is prescribed), a NaN tilt rate is not prescribed,
-  a NaN rotor speed a free rotor (aero drag torque still acts).
-"""
+"""``DrakeMultirotor`` solves the dynamics using the Multibody physics engine 'Drake'."""
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 import numpy as np
-from pydrake.common.value import AbstractValue
 from pydrake.math import RigidTransform, RotationMatrix
-from pydrake.multibody.math import SpatialForce, SpatialVelocity
-from pydrake.multibody.plant import ExternallyAppliedSpatialForce, MultibodyPlant
+from pydrake.multibody.math import SpatialVelocity
+from pydrake.multibody.plant import MultibodyPlant
 from pydrake.multibody.tree import FixedOffsetFrame, RevoluteJoint, RotationalInertia, SpatialInertia
 from pydrake.systems.analysis import ApplySimulatorConfig, Simulator, SimulatorConfig
-from pydrake.systems.framework import DiagramBuilder, EventStatus, LeafSystem
+from pydrake.systems.framework import DiagramBuilder, EventStatus
 from scipy.spatial.transform import Rotation
 
-from rotorpy.vehicles.multirotor import Multirotor
-from rotorpy.vehicles.multirotor_params import complete_state, prepare_structured, rotor_aero_loads
-from rotorpy.vehicles.types import InertiaTensor, Mass, Position
+from rotorpy.vehicles.drake.effectors import Effectors
+from rotorpy.vehicles.models.actuator import limits
+from rotorpy.vehicles.models.aero import AirframeState
+from rotorpy.vehicles.models.spec import VehicleSpec, complete_state, hover_state
+from rotorpy.vehicles.types import (
+    AngularVelocity, InertiaTensor, Mass, PerAssembly, PerRotor, PerSurface, Position, Quaternion, Velocity,
+)
 
-# State keys owned by the Drake solver (continuous state). 
-DYNAMIC_KEYS = ("x", "v", "q", "w", "rotor_speeds", "tilt_angles", "tilt_rates", "tilt_torques")
+
+class DrakeControl(TypedDict, total=False):
+    """The control dict ``step`` and ``statedot`` accept, shared with the controller that produces it.
+
+    One of ``cmd_motor_speeds`` (rad/s) / ``cmd_motor_thrusts`` (N) / ``cmd_motor_torques`` (N*m), per
+    ``control_abstraction``; a NaN entry is a free rotor.  The rest are optional and default to NaN: ``cmd_tilt_torques`` (N*m, NaN = free hinge),
+    ``cmd_tilt_rates`` (rad/s, NaN = not prescribed), ``cmd_surface_deflections`` (rad, NaN = hold, in
+    ``spec.airframe.surfaces`` order, the same order the state's ``surface_deflections`` comes back in).
+    """
+
+    cmd_motor_speeds: PerRotor
+    cmd_motor_thrusts: PerRotor
+    cmd_motor_torques: PerRotor
+    cmd_tilt_torques: PerAssembly
+    cmd_tilt_rates: PerAssembly
+    cmd_surface_deflections: PerSurface
+
+
+class DrakeState(TypedDict):
+    """The state dict ``step`` returns (and takes back): RotorPy's keys plus the tilt and surface actuators."""
+
+    x: Position
+    v: Velocity
+    q: Quaternion
+    w: AngularVelocity
+    wind: Velocity
+    rotor_speeds: PerRotor
+    tilt_angles: PerAssembly
+    tilt_rates: PerAssembly
+    tilt_torques: PerAssembly
+    surface_deflections: PerSurface
+
+
+# State keys owned by the Drake solver (continuous state).
+DYNAMIC_KEYS = tuple(key for key in DrakeState.__annotations__ if key != "wind")
+CONTROL_ABSTRACTIONS = ("cmd_motor_speeds", "cmd_motor_thrusts", "cmd_motor_torques")
 
 
 def _central_spatial_inertia(mass: Mass, com: Position, inertia: InertiaTensor) -> SpatialInertia:
@@ -55,44 +69,10 @@ def _central_spatial_inertia(mass: Mass, com: Position, inertia: InertiaTensor) 
     return SpatialInertia.MakeFromCentralInertia(mass, np.asarray(com, dtype=float), rotational)
 
 
-def _rotor_frame(spec):
-    """Rotation from a rotor's own frame R to its parent frame P (``R_PR``), which 
-    can be the nacelle of the airframe given our model.
-
-    R has its origin at the hub and z along the spin (thrust) axis; its x/y
-    are arbitrary (assumption of always axisymmetric rotor). 
-     
-    Positions ``hub_offset`` and ``thrust_axis`` are given in P, the rotor ``inertia`` in R, e.g.
-    ``diag(I_t, I_t, I_p)`` with I_p the spin inertia.
-    """
-
-    axis = np.asarray(spec.get("thrust_axis", [0.0, 0.0, 1.0]), dtype=float)
-    return _rotation_with_z(axis / np.linalg.norm(axis))
-
-
-def _with_parent_frame_inertias(quad_params, rotor_specs):
-    """Copy of ``quad_params`` with rotor inertias along the parent's axes.
-
-    The shared parser keeps Multirotor contract (rotor inertia in P) and
-    derives the mass properties and axisymmetry check from it:
-    I_P = R_PR I_R R_PR^T.
-    """
-
-    if "rotors" not in quad_params:
-        return quad_params
-    rotors = []
-    for spec in rotor_specs:
-        if "inertia" in spec:
-            r_pr = _rotor_frame(spec)
-            spec = {**spec, "inertia": r_pr @ np.asarray(spec["inertia"], dtype=float) @ r_pr.T}
-        rotors.append(spec)
-    return {**quad_params, "rotors": rotors}
-
-
 def _rotation_with_z(axis):
-    """Deterministic right-handed frame whose z-axis is the unit ``axis``.
-    Helper also used for rotor positioning when assembling the plant.
-    """
+    """Rotation ``R_PR`` from a rotor's own frame R to its parent frame P: a deterministic right-handed frame whose
+    z-axis is the unit thrust ``axis``.  R has its origin at the hub; its x/y are arbitrary (the rotor is
+    axisymmetric), so the rotor inertia in R is ``diag(I_t, I_t, J_p)``."""
 
     reference = np.array([1.0, 0.0, 0.0])
     if abs(np.dot(axis, reference)) > 0.9:
@@ -102,98 +82,51 @@ def _rotation_with_z(axis):
     return np.column_stack((x_axis, np.cross(axis, x_axis), axis))
 
 
-class DrakeMultirotor(Multirotor):
-    """Standalone torque-driven RotorPy vehicle integrated by Drake."""
+class DrakeMultirotor:
+    """Standalone torque-driven RotorPy vehicle integrated by Drake.
+
+    The part models are pure functions of their inputs; Drake may call them repeatedly at Runge-Kutta stages.
+    """
 
     def __init__(
         self,
-        quad_params,
+        spec: VehicleSpec,
         initial_state=None,
         control_abstraction="cmd_motor_speeds",
-        aero=True,
         gravity=9.81,
         integrator="runge_kutta3", # todo: also on the types improvement: let it be an enum of allowed integrators on Drake's code
         accuracy=1e-8,
         max_step=None,
-        enable_ground=False,
     ):
-        if enable_ground:
-            raise ValueError("DrakeMultirotor has no ground model")
-        if control_abstraction not in {"cmd_motor_speeds", "cmd_motor_thrusts"}:
-            raise ValueError("DrakeMultirotor supports cmd_motor_speeds and cmd_motor_thrusts")
-        if "airframe" not in quad_params:
-            raise ValueError("DrakeMultirotor requires the structured multirotor parameter form")
-        rotor_specs = quad_params.get("rotors", [])
-        rotor_specs = list(rotor_specs.values()) if hasattr(rotor_specs, "values") else list(rotor_specs)
-
-        # Rotor inertia is given in the rotor's own frame (see _rotor_frame).
-        self._rotor_inertias = [np.asarray(spec.get("inertia", np.zeros((3, 3))), dtype=float) for spec in rotor_specs]
-        base_params, model = prepare_structured(_with_parent_frame_inertias(quad_params, rotor_specs), initial_state)
-        self._model = model
-        self.num_assemblies = model["assembly_masses"].size
-        initial_state = complete_state(initial_state, model["rotor_count"], self.num_assemblies,
-                                       model["initial_angles"], model["initial_rates"], quad_params)
-        
-        # Multirotor builds scalar rotor-drag terms from k_d/k_z/k_h; the
-        # per-rotor arrays are restored below, as MultirotorExtended does.
-        super().__init__({**base_params, "k_d": 0.0, "k_z": 0.0, "k_h": 0.0}, initial_state,
-                         control_abstraction, aero=aero)
-
-        # todo: it's also hardcoded, hard to keep params track of. Potential fix when introducing pydantic.
-        for name in ("k_eta", "k_m", "k_d", "k_z", "k_h", "k_flap", "tau_m", "rotor_speed_min", "rotor_speed_max"):
-            setattr(self, name, np.asarray(base_params[name], dtype=float).copy())
-
+        self.spec = spec
+        self.num_rotors = spec.num_rotors
+        self.num_assemblies = spec.num_assemblies
+        self.num_surfaces = len(spec.airframe.surfaces)
+        self.mass = self.total_mass = spec.total_mass
         self.g = gravity
         self.weight = np.array([0.0, 0.0, -self.mass * self.g])
+        self.control_abstraction = control_abstraction
 
-        #todo: why not? what breaks? we should.
-        if np.any(model["rate_limit"] == 0.0):
-            raise ValueError("DrakeMultirotor does not support frozen (rate_limit == 0) tilt actuators")
+        self.rotor_directions = spec.rotor_values("direction")
+        self._jp = spec.rotor_values("spin_inertia")
+        self.tilt_rate_limit = np.array([assembly.rate_limit for assembly in spec.assemblies])
+        # The actuators, per command (plan §R.8): rotor speed, hinge torque and rate, surface deflection.
+        self.speed_actuators = [rotor.speed for rotor in spec.rotors]
+        self.torque_actuators = [assembly.torque for assembly in spec.assemblies]
+        self.rate_actuators = [assembly.rate for assembly in spec.assemblies]
+        self.deflection_actuators = [surface.deflection for surface in spec.airframe.surfaces]
 
-        self.rotor_directions = model["rotor_directions"].copy()
-        self.tilt_rate_limit = model["rate_limit"].copy()
-        specs = quad_params.get("assemblies", [])
-        specs = list(specs.values()) if hasattr(specs, "values") else list(specs)
-        self.torque_lag = np.array([float(spec.get("torque_lag", 0.0)) for spec in specs])
-        if not np.all(np.isfinite(self.torque_lag)) or np.any(self.torque_lag < 0.0):
-            raise ValueError("torque_lag must be finite and nonnegative")
-        self.rate_lag = np.array([float(spec.get("rate_lag", 0.05)) for spec in specs])
-        if not np.all(np.isfinite(self.rate_lag)) or np.any(self.rate_lag <= 0.0):
-            raise ValueError("rate_lag must be finite and positive")
-        self.initial_state = dict(self.initial_state)
+        self.initial_state = complete_state(hover_state(spec) if initial_state is None else initial_state,
+                                            self.num_rotors, self.num_assemblies)
         self.initial_state.setdefault("tilt_torques", np.zeros(self.num_assemblies))
-        self.total_mass = model["total_mass"]
-
-        self._jp = model["rotor_polar_inertia"].copy()
-        if np.any(np.linalg.norm(model["rotor_inertias"], axis=(1, 2)) == 0.0):
-            raise ValueError("DrakeMultirotor needs a full rotor inertia on every rotor (spin DOF)")
-        if np.any(self._hinge_inertias() <= 0.0):
-            raise ValueError("every tilt hinge needs a positive locked inertia (assembly + rotors)")
+        self.initial_state.setdefault("surface_deflections", np.zeros(self.num_surfaces))
 
         self._build(gravity)
         self._configure_simulator(integrator, accuracy, max_step)
 
-    # ------------------------------------------------------------------ model
-    def _hinge_inertias(self):
-        """Locked inertia of each assembly + its rotors about its hinge at delta=0."""
-
-        m = self._model
-        result = np.zeros(self.num_assemblies)
-        for a in range(self.num_assemblies):
-            axis, r0 = m["hinge_axes"][a], m["zero_orientations"][a]
-            parts = [(m["assembly_masses"][a], m["assembly_com_offsets"][a], m["assembly_inertias"][a])]
-            parts += [
-                (m["rotor_masses"][i], m["rotor_hub_offsets"][i], m["rotor_inertias"][i])
-                for i in np.flatnonzero(m["rotor_assembly"] == a)
-            ]
-            for mass, offset, inertia in parts:
-                r = r0 @ offset
-                about_pivot = r0 @ inertia @ r0.T + mass * (r @ r * np.eye(3) - np.outer(r, r))
-                result[a] += axis @ about_pivot @ axis
-        return result
-
+    # ------ Multibody Dynamic Model --------
     def _build(self, gravity):
-        m = self._model
+        spec = self.spec
         builder = DiagramBuilder()
         plant = builder.AddSystem(MultibodyPlant(time_step=0.0))
         plant.mutable_gravity_field().set_gravity_vector([0.0, 0.0, -gravity])
@@ -205,22 +138,22 @@ class DrakeMultirotor(Multirotor):
                 name, body.body_frame(), RigidTransform(RotationMatrix(rotation), translation)))
 
         self.airframe = plant.AddRigidBody("airframe", _central_spatial_inertia(
-            m["airframe_mass"], m["airframe_com"], m["airframe_inertia"]))
+            spec.airframe.mass, spec.airframe.com_offset, spec.airframe.inertia))
         self.assembly_bodies, self.tilt_joints = [], []
 
         # Assemble all nacelles
-        for a in range(self.num_assemblies):
+        for a, assembly in enumerate(spec.assemblies):
             # Create the tilting nacelle body with it's inertia props.
             body = plant.AddRigidBody(f"assembly_{a}", _central_spatial_inertia(
-                m["assembly_masses"][a], m["assembly_com_offsets"][a], m["assembly_inertias"][a]))
+                assembly.mass, assembly.com_offset, assembly.inertia))
 
             # Create the "hinge frame", attached to the parent (airframe) body, at the prescribed pivot location.
-            r0 = m["zero_orientations"][a]
-            parent = offset_frame(f"hinge_{a}", self.airframe, r0, m["pivots"][a])
+            r0 = assembly.zero_orientation
+            parent = offset_frame(f"hinge_{a}", self.airframe, r0, assembly.pivot)
 
             # Connect the 2 of them, allowing for a torque applied about the hinge axis (whatever servo  used)
             joint = plant.AddJoint(RevoluteJoint(
-                f"tilt_{a}", parent, body.body_frame(), r0.T @ m["hinge_axes"][a]))
+                f"tilt_{a}", parent, body.body_frame(), r0.T @ assembly.hinge_axis))
             plant.AddJointActuator(f"tilt_motor_{a}", joint)
 
             self.assembly_bodies.append(body)
@@ -228,20 +161,19 @@ class DrakeMultirotor(Multirotor):
 
         # Assemble all rotors
         self.rotor_bodies, self.spin_joints = [], []
-        for i in range(self.num_rotors):
-            a = m["rotor_assembly"][i]
+        for i, rotor in enumerate(spec.rotors):
             # if not specified, the rotor is attached directly to the airframe (like a prop).
-            parent_body = self.airframe if a < 0 else self.assembly_bodies[a]
-            # Rotor body frame R (see _rotor_frame): origin at the hub, which
+            parent_body = self.airframe if rotor.assembly is None else self.assembly_bodies[rotor.assembly]
+            # Rotor body frame R (see _rotation_with_z): origin at the hub, which
             # is the rotor COM, z along the thrust axis; rz = R_PR places it.
-            rz = _rotation_with_z(m["rotor_axes_parent"][i])
+            rz = _rotation_with_z(rotor.thrust_axis)
 
             # Create the rotor body itself.
-            body = plant.AddRigidBody(f"rotor_{i}", _central_spatial_inertia(
-                m["rotor_masses"][i], np.zeros(3), self._rotor_inertias[i]))
+            own_inertia = np.diag([rotor.transverse_inertia, rotor.transverse_inertia, rotor.spin_inertia])
+            body = plant.AddRigidBody(f"rotor_{i}", _central_spatial_inertia(rotor.mass, np.zeros(3), own_inertia))
 
             # Create the "hub frame", attached to the parent body at the rotor hub location.
-            parent = offset_frame(f"hub_{i}", parent_body, rz, m["rotor_hub_offsets"][i])
+            parent = offset_frame(f"hub_{i}", parent_body, rz, rotor.hub_offset)
 
             # Connect the rotor body to the hub frame with a revolute joint allowing it to spin about its thrust axis.
             joint = plant.AddJoint(RevoluteJoint(f"spin_{i}", parent, body.body_frame(), [0.0, 0.0, 1.0]))
@@ -306,12 +238,15 @@ class DrakeMultirotor(Multirotor):
         plant.SetFreeBodySpatialVelocity(ctx, self.airframe, SpatialVelocity(
             omega_w, np.asarray(state["v"], dtype=float) - com_velocity))
 
-        # Set initial torques of the tilt hinges
-        if self.num_assemblies:
+        # Set initial lag states: tilt torques, then surface deflections
+        if self.num_assemblies or self.num_surfaces:
             torques = np.asarray(state.get("tilt_torques", np.zeros(self.num_assemblies)), dtype=float)
-            self.effectors.GetMyMutableContextFromRoot(root).SetContinuousState(torques)
+            deflections = np.asarray(
+                state.get("surface_deflections", np.zeros(self.num_surfaces)), dtype=float)
+            self.effectors.GetMyMutableContextFromRoot(root).SetContinuousState(
+                np.concatenate((torques, deflections)))
 
-    def _get_state(self, wind):
+    def _get_state(self, wind) -> DrakeState:
         plant, ctx = self.plant, self.plant_context
         pose = plant.EvalBodyPoseInWorld(ctx, self.airframe)
         rotation = pose.rotation().matrix()
@@ -326,36 +261,41 @@ class DrakeMultirotor(Multirotor):
             "tilt_angles": np.array([j.get_angle(ctx) for j in self.tilt_joints]),
             "tilt_rates": np.array([j.get_angular_rate(ctx) for j in self.tilt_joints]),
             "tilt_torques": self.effectors.applied_tilt_torques(self.effectors.GetMyContextFromRoot(self.context)),
+            "surface_deflections": self.effectors.surface_deflections(
+                self.effectors.GetMyContextFromRoot(self.context)),
         }
 
-    def _commands(self, state, control):
-        if self.control_abstraction == "cmd_motor_speeds":
-            speeds = np.asarray(control["cmd_motor_speeds"], dtype=float)
-        elif self.control_abstraction == "cmd_motor_thrusts":
-            thrusts = np.asarray(control["cmd_motor_thrusts"], dtype=float) / self.k_eta
-            speeds = np.sign(thrusts) * np.sqrt(np.abs(thrusts))
+    def airframe_state(self) -> AirframeState:
+        """What the airframe's model is handed at the current state (for logging)."""
+
+        return self.effectors.airframe_state(self.context)
+
+    def _commands(self, state, control: DrakeControl):
+        """The command port: each command clipped to its actuator's limits (NaN passes)."""
+
+        k, s = self.num_assemblies, self.num_surfaces
+        if self.control_abstraction == "cmd_motor_torques":
+            rotors = np.asarray(control["cmd_motor_torques"], dtype=float)
         else:
-            raise ValueError("DrakeMultirotor supports cmd_motor_speeds and cmd_motor_thrusts")
-        speeds = np.clip(speeds, self.rotor_speed_min, self.rotor_speed_max)  # NaN passes through
-        k = self.num_assemblies
-        tilts = np.asarray(control.get("cmd_tilt_torques", np.full(k, np.nan)), dtype=float)
-        rates = np.asarray(control.get("cmd_tilt_rates", np.full(k, np.nan)), dtype=float)
-        if speeds.shape != (self.num_rotors,) or tilts.shape != (k,) or rates.shape != (k,):
-            raise ValueError("commands must have one value per rotor / per assembly")
-        both = np.flatnonzero(~np.isnan(tilts) & ~np.isnan(rates))
-        if both.size:
-            raise ValueError(f"tilt hinges {both.tolist()} got both cmd_tilt_torques and cmd_tilt_rates; "
-                             "pass NaN for one of them")
-        tilts = np.nan_to_num(tilts, nan=0.0)  # NaN = zero torque = free hinge (or a rate-prescribed one)
-        wind = np.asarray(state["wind"], dtype=float)
-        return np.concatenate((tilts, rates, speeds, wind))
+            if self.control_abstraction == "cmd_motor_speeds":
+                rotors = np.asarray(control["cmd_motor_speeds"], dtype=float)
+            else:
+                rotors = np.array([rotor.model.speed_for_thrust(thrust)
+                                   for rotor, thrust in zip(self.spec.rotors, control["cmd_motor_thrusts"])])
+            rotors = np.clip(rotors, *limits(self.speed_actuators))
+        # NaN torque = zero torque = free hinge (or a rate-prescribed one).
+        tilts = np.clip(np.nan_to_num(np.asarray(control.get("cmd_tilt_torques", np.zeros(k)), dtype=float)),
+                        *limits(self.torque_actuators))
+        rates = np.clip(np.asarray(control.get("cmd_tilt_rates", np.full(k, np.nan)), dtype=float),
+                        *limits(self.rate_actuators))
+        deflections = np.clip(np.asarray(control.get("cmd_surface_deflections", np.full(s, np.nan)), dtype=float),
+                              *limits(self.deflection_actuators))
+        return np.concatenate((tilts, rates, rotors, deflections, np.asarray(state["wind"], dtype=float)))
 
     def _load(self, state, control, root=None):
         root = self.context if root is None else root
-        # A plain RotorPy state (no tilt_* keys, e.g. from a vanilla vehicle)
-        # gets the model's initial tilt
-        state = complete_state(state, self.num_rotors, self.num_assemblies,
-                               self._model["initial_angles"], self._model["initial_rates"], {})
+        # A plain RotorPy state (no tilt_* keys, e.g. from a vanilla vehicle) gets zero tilt.
+        state = complete_state(state, self.num_rotors, self.num_assemblies)
         self._set_state(state, root)
         self.diagram.get_input_port(0).FixValue(root, self._commands(state, control))
 
@@ -367,7 +307,7 @@ class DrakeMultirotor(Multirotor):
         return last is not None and all(
             key in state and np.array_equal(np.asarray(state[key]), last[key]) for key in DYNAMIC_KEYS)
 
-    def step(self, state, control, t_step):
+    def step(self, state: DrakeState, control: DrakeControl, t_step) -> DrakeState:
         # Two paths: if the caller hands back the state we last returned
         # (only commands/wind may differ), keep advancing the same context with simulator.AdvanceTo(.)
         # If not, we re-seed the context of the plant in Drake.
@@ -409,7 +349,7 @@ class DrakeMultirotor(Multirotor):
         )
         return EventStatus.Failed(self.diagram, self._violation)
 
-    def statedot(self, state, control, t_step):
+    def statedot(self, state: DrakeState, control: DrakeControl, t_step):
         del t_step
         # When `state` is what step() last returned, the live context already
         # holds it: fix the new commands and evaluate there.
@@ -427,166 +367,3 @@ class DrakeMultirotor(Multirotor):
             "vdot": np.asarray(plant.CalcCenterOfMassTranslationalAccelerationInWorld(ctx)).copy(),
             "wdot": rotation.T @ vdot[start : start + 3],  # d/dt(R^T w_W) = R^T alpha_W
         }
-
-
-# Use LeafSystem to apply any sort of aerodynamic, propulsive, etc. external force into the plant
-# as the simulation advances.
-class Effectors(LeafSystem):
-    """Tilt torque lag, rotor motors and aerodynamics as continuous feedback.
-
-    Inputs: plant state; commands = [tilt torque cmds (K), tilt rate cmds
-    (K, NaN = not prescribed), rotor speed cmds (N), wind (3)].  Continuous
-    state: lagged tilt torques (K).
-    Outputs: joint actuation (tilt then spin, in actuator order) and the
-    aerodynamic ExternallyAppliedSpatialForce list.
-    """
-
-    def __init__(self, vehicle):
-        super().__init__()
-        self._v = vehicle
-        plant = vehicle.plant
-        k, n, m = vehicle.num_assemblies, vehicle.num_rotors, vehicle._model
-        self._plant_context = plant.CreateDefaultContext()
-        self.DeclareVectorInputPort("state", plant.num_multibody_states())
-        self.DeclareVectorInputPort("commands", 2 * k + n + 3)
-        self.DeclareVectorOutputPort("actuation", plant.num_actuated_dofs(), self._calc_actuation)
-        self.DeclareAbstractOutputPort(
-            "spatial_forces",
-            lambda: AbstractValue.Make([ExternallyAppliedSpatialForce()]),
-            self._calc_forces,
-        )
-        self._coeffs = (vehicle.k_eta, vehicle.k_m, vehicle.k_d, vehicle.k_z, vehicle.k_h, vehicle.k_flap,
-                        vehicle.rotor_directions, vehicle.drag_matrix, vehicle.aero)
-        self._k_m = vehicle.k_m
-        self._tilt_rows = np.array([joint.velocity_start() for joint in vehicle.tilt_joints], dtype=int)
-        self._spin_rows = np.array([joint.velocity_start() for joint in vehicle.spin_joints], dtype=int)
-        self._actuation_matrix = plant.MakeActuationMatrix()
-        self._lagged = vehicle.torque_lag > 0.0
-        self._lag = np.where(self._lagged, vehicle.torque_lag, 1.0)
-        if k:
-            self.DeclareContinuousState(k)
-        self._com_offset = np.asarray(m["airframe_com"], dtype=float)
-
-    def tilt_torques(self, context):
-        """Applied hinge torques: lag state, or the command when torque_lag == 0."""
-
-        k = self._v.num_assemblies
-        if k == 0:
-            return np.zeros(0)
-        command = self.get_input_port(1).Eval(context)[:k]
-        return np.where(self._lagged, context.get_continuous_state_vector().CopyToVector(), command)
-
-    def applied_tilt_torques(self, context):
-        """Hinge torques actually applied: the solved ones on rate-prescribed hinges, tilt_torques() elsewhere."""
-
-        return np.asarray(self.get_output_port(0).Eval(context))[: self._v.num_assemblies].copy()
-
-    def DoCalcTimeDerivatives(self, context, derivatives):
-        k = self._v.num_assemblies
-        if k == 0:
-            return
-        cmd = self.get_input_port(1).Eval(context)
-        command, prescribed = cmd[:k], ~np.isnan(cmd[k : 2 * k])
-        if prescribed.any():
-            # The lag state of a rate-prescribed hinge follows the solved torque, so a switch back to a torque
-            # command starts from the torque the hinge was carrying.
-            command = np.where(prescribed, self.applied_tilt_torques(context), command)
-        applied = context.get_continuous_state_vector().CopyToVector()
-        derivatives.get_mutable_vector().SetFromVector(np.where(self._lagged, (command - applied) / self._lag, 0.0))
-
-    def _sync(self, context):
-        self._v.plant.SetPositionsAndVelocities(self._plant_context, self.get_input_port(0).Eval(context))
-        return self._plant_context
-
-    def _aero(self, context):
-        """Aero loads (body components) plus the airframe rotation."""
-
-        v, plant = self._v, self._v.plant
-        ctx = self._sync(context)
-        wind = self.get_input_port(1).Eval(context)[-3:]
-        pose = plant.EvalBodyPoseInWorld(ctx, v.airframe)
-        r_wb = pose.rotation().matrix()
-        axes, hub_air = [], []
-
-        for body in v.rotor_bodies:
-            axes.append(r_wb.T @ plant.EvalBodyPoseInWorld(ctx, body).rotation().matrix()[:, 2])
-            hub_air.append(r_wb.T @ (plant.EvalBodySpatialVelocityInWorld(ctx, body).translational() - wind))
-
-        v_air = plant.EvalBodySpatialVelocityInWorld(ctx, v.airframe).Shift(
-            r_wb @ self._com_offset).translational()
-        
-        speeds = self._rotor_speeds(ctx)
-        loads = rotor_aero_loads(speeds, np.array(axes), np.array(hub_air), r_wb.T @ (v_air - wind), *self._coeffs)
-        return loads, r_wb, speeds
-
-    def _rotor_speeds(self, ctx):
-        return np.array([-s * j.get_angular_rate(ctx) for s, j in zip(self._v.rotor_directions, self._v.spin_joints)])
-
-    def _calc_actuation(self, context, output):
-        """Tilt torques, then the spin torques that prescribe each rotor's speed.
-
-        A hinge with a tilt-rate command is prescribed the same way: its rate follows the command through the
-        first-order ``rate_lag`` and its torque is solved for.  Tilt and spin prescriptions are coupled through the
-        mass matrix, so they are solved together.
-
-        The rotor speed is prescribed, as in the reference models: Omega (relative to the rotor's parent) follows
-        the motor lag exactly, and the spin torque is the constraint torque that makes it so.  Here we are modelling 
-        the motor as a rotation joint where a torque must be provided. This is more realistic, but breaks the interface
-        of prescribing rotor speeds directly. 
-
-        That's why we need to infer the exact torque that would be required at each spin joint to achieve the commanded
-        rotor speed. Acceleration is affine in the actuation, vdot(u0 + du) = vdot(u0) + M^-1 B du, so the spin torque
-        correction solves  S M^-1 B_s du = thetaddot_lag - S vdot(u0)  (S picks the prescribed rows).
-        """
-
-        v = self._v
-        ctx = self._sync(context)
-        cmd = self.get_input_port(1).Eval(context)
-        k, n = v.num_assemblies, v.num_rotors
-        rate_cmd, speed_cmd = cmd[k : 2 * k], cmd[2 * k : 2 * k + n]
-        tau_tilt = np.where(np.isnan(rate_cmd), self.tilt_torques(context), 0.0)
-        rate = np.array([joint.get_angular_rate(ctx) for joint in v.tilt_joints])
-        speed, sigma = self._rotor_speeds(ctx), v.rotor_directions
-        # Target joint accelerations, in actuator order (tilt, then spin); NaN where not prescribed.
-        target = np.concatenate(((rate_cmd - rate) / v.rate_lag, -sigma * (speed_cmd - speed) / v.tau_m))
-
-        # Predictor: the isolated-rotor torque (lag inertia torque + aero drag couple).  Exact up to the parent's
-        # axial acceleration.
-        tau_spin = np.where(np.isnan(speed_cmd), 0.0, -sigma * (v._jp * (speed_cmd - speed) / v.tau_m
-                                                                 + self._k_m * speed * np.abs(speed)))
-        actuation = np.concatenate((tau_tilt, tau_spin))
-        accel = self._acceleration(ctx, actuation, self._spatial_forces(context))
-        prescribed = np.flatnonzero(~np.isnan(np.concatenate((rate_cmd, speed_cmd))))
-        if prescribed.size:
-            rows = np.concatenate((self._tilt_rows, self._spin_rows))[prescribed]
-            mobility = np.linalg.solve(v.plant.CalcMassMatrix(ctx), self._actuation_matrix[:, prescribed])
-            actuation[prescribed] += np.linalg.solve(mobility[rows], target[prescribed] - accel[rows])
-        output.SetFromVector(actuation)
-
-    def _acceleration(self, ctx, actuation, forces):
-        """Generalized acceleration of the (synced) plant context under the given inputs."""
-
-        plant = self._v.plant
-        plant.get_actuation_input_port().FixValue(ctx, actuation)
-        plant.get_applied_spatial_force_input_port().FixValue(ctx, AbstractValue.Make(forces))
-        return plant.get_generalized_acceleration_output_port().Eval(ctx)
-
-    def _spatial_forces(self, context):
-        v = self._v
-        loads, r_wb, _ = self._aero(context)
-        forces = []
-        for i, body in enumerate(v.rotor_bodies):
-            moment = loads["reaction_moments"][i] + loads["flap_moments"][i]
-            forces.append(self._applied(body, np.zeros(3), r_wb @ moment, r_wb @ loads["forces"][i]))
-        forces.append(self._applied(v.airframe, self._com_offset, np.zeros(3), r_wb @ loads["drag"]))
-        return forces
-
-    def _calc_forces(self, context, output):
-        output.set_value(self._spatial_forces(context))
-
-    def _applied(self, body, point_body, torque_w, force_w):
-        applied = ExternallyAppliedSpatialForce()
-        applied.body_index = body.index()
-        applied.p_BoBq_B = point_body
-        applied.F_Bq_W = SpatialForce(torque_w, force_w)
-        return applied
