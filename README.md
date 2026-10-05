@@ -1,6 +1,36 @@
-Note, this is a fork of [rotorpy](https://github.com/spencerfolk/rotorpy) Please read expanding to vtol to get an idea of the objective of the fork.
+This is a fork of [rotorpy](https://github.com/spencerfolk/rotorpy).
 
-# RotorPy
+Summary: expand the dynamic simulation code to support VTOL aircraft, with a particular focus on tiltrotors.
+
+In its current state (still a WIP), it supports rotorcraft with different rotor dynamics, fixed-wing aircraft with control-surface deflections, and tiltrotors, by means of an underlying multibody dynamics simulator (pydrake) that solves for every rotational (gyroscopic) effect, moving masses, a changing COM, etc.
+
+The strategy is to decouple the dynamics simulator as much as possible from the aerodynamic, propulsion and actuator models, using Python's type system to keep it easy to read and modular.
+
+This fork already includes some non-trivial aerodynamic models that expand on those originally in this repo, to get started with VTOL or fixed-wing simulations.
+
+## Index
+
+- [Expanding to VTOL](./EXPANDING_TO_VTOL.md): the goal and strategy of the fork.
+- [Docs](./docs/): theory and model descriptions, e.g. [the interaction aerodynamics model](./docs/INTERACTION_AERODYNAMICS_MODEL.md).
+- [Verification coverage](./VERIFICATION_COVERAGE.md): how the new implementations are verified, including against the original `Multirotor`.
+
+## Installation (this fork)
+
+`pip install rotorpy` installs the upstream package, not this fork. Install from source instead, with the `drake` extra for the multibody simulator (`DrakeMultirotor`, pinned to `drake==1.46.0`):
+
+```bash
+git clone https://github.com/gianfra-t/rotorpy.git
+cd rotorpy
+pip install -e ".[drake]"            # the fork, editable, with pydrake
+pip install -e ".[drake,testing]"    # also the test dependencies
+python -m pytest tests               # run the test suite
+```
+
+The `all` extra does not include `drake`; add it explicitly (`".[all,drake]"`). Drake publishes wheels for a limited set of Python versions and platforms (see the [Drake pip install page](https://drake.mit.edu/pip.html)); this fork is developed on Python 3.12.
+
+
+
+# RotorPy (Original Readme)
 A Python-based multirotor simulation environment with aerodynamic wrenches, useful for education and research in estimation, planning, and control for UAVs.
 <p align="center"><img src="/media/double_pillar.gif" width="32%"/><img src="/media/gusty.gif" width="32%"/><img src="/media/minsnap.gif" width="32%"/></p>
 
