@@ -12,7 +12,7 @@ This fork already includes some non-trivial aerodynamic models that expand on th
 
 - [Expanding to VTOL](./EXPANDING_TO_VTOL.md): the goal and strategy of the fork.
 - [Docs](./docs/): theory and model descriptions, e.g. [the interaction aerodynamics model](./docs/INTERACTION_AERODYNAMICS_MODEL.md).
-- [Verification coverage](./VERIFICATION_COVERAGE.md): how the new implementations are verified, including against the original `Multirotor`.
+- [Verification coverage](./verifications/VERIFICATION_COVERAGE.md): how the new implementations are verified, including against the original `Multirotor`.
 
 ## Installation (this fork)
 
