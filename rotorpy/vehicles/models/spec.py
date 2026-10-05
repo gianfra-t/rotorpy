@@ -40,6 +40,10 @@ class ControlSurface:
 class Airframe:
     """The fixed body: ``mass`` (kg), ``com_offset`` from the airframe origin, central ``inertia``; its control
     ``surfaces`` and its aerodynamic model ``aero`` (``None``: no airframe aerodynamics).
+
+    The airframe origin is the aerodynamic moment reference point: ``aero`` reads the flow there and returns its
+    wrench about it.  Put it at a fixed geometric point (conventionally the wing's mean-aerodynamic-chord quarter
+    chord); a mass change then moves ``com_offset``, never the coefficients.
     
     On any standard 6-DOF code, this class and it's surfaces would be enough to model the aircraft 
     """

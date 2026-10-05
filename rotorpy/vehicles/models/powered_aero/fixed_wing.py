@@ -9,7 +9,7 @@ import numpy as np
 from rotorpy.vehicles.models.aero import (
     COEFFICIENT_NAMES, FRD_FROM_FLU, AeroCoefficients, AerodynamicWrench, AirframeState, body_from_wind, flow_angles,
 )
-from rotorpy.vehicles.models.powered_aero.splines import RectSpline, cross3, smooth_clamp
+from rotorpy.vehicles.models.powered_aero.splines import RectSpline, smooth_clamp
 from rotorpy.vehicles.models.powered_aero.types import PoweredAeroData
 
 if TYPE_CHECKING:
@@ -57,8 +57,8 @@ class FixedWingAero:
 
     def __call__(self, state: AirframeState) -> AerodynamicWrench:
         reference, w = self.reference, state.w
-        # One frame conversion at the boundary: FRD flow angles and rates at the MRP.
-        speed, alpha, beta = flow_angles(state.airspeed + cross3(w, reference.mrp_xyz))
+        # One frame conversion at the boundary: FRD flow angles and rates at the airframe origin (the MRP).
+        speed, alpha, beta = flow_angles(state.airspeed)
         p, q, r = FRD_FROM_FLU @ w
         c = self.coefficients(alpha, beta, state.surface_deflections)
         qbar = 0.5 * self.rho * speed * speed
@@ -76,6 +76,4 @@ class FixedWingAero:
         moment_frd[1] += scale * cbar * cbar * d.Cmq * q
         moment_frd[2] += scale * span * span * (d.Cnp * p + d.Cnr * r)
 
-        # Moment transfer from the MRP to the airframe origin: M_O = M_MRP + r_MRP x F.
-        force = FRD_FROM_FLU @ force_frd
-        return AerodynamicWrench(force, FRD_FROM_FLU @ moment_frd + cross3(reference.mrp_xyz, force))
+        return AerodynamicWrench(FRD_FROM_FLU @ force_frd, FRD_FROM_FLU @ moment_frd)

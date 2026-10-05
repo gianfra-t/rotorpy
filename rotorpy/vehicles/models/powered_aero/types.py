@@ -184,7 +184,7 @@ class PairData:
 
 @dataclass(frozen=True, kw_only=True)
 class PoweredAeroData:
-    """The whole data file: reference geometry (``area``, ``span``, ``cbar``, the MRP ``mrp_xyz``), the air density
+    """The whole data file: reference geometry (``area``, ``span``, ``cbar``), the air density
     ``rho`` it assumes, the rotor fits, the clean airframe, the receivers, the (receiver, source) pairs and the
     control-surface increments.  ``meta`` says when and from what it was built."""
 
@@ -193,7 +193,6 @@ class PoweredAeroData:
     area: float
     span: float
     cbar: float
-    mrp_xyz: np.ndarray
     rotors: Tuple[RotorFit, ...]
     clean: CleanData
     receivers: Tuple[ReceiverData, ...]
@@ -203,7 +202,7 @@ class PoweredAeroData:
     def __post_init__(self):
         if not all(value > 0.0 for value in (self.rho, self.area, self.span, self.cbar)):
             raise ValueError("rho and the reference S, b and cbar must be positive")
-        _set(self, mrp_xyz=_array(self.mrp_xyz, (3,), "mrp_xyz"), rotors=tuple(self.rotors),
+        _set(self, rotors=tuple(self.rotors),
              receivers=tuple(self.receivers), pairs=tuple(self.pairs), surfaces=tuple(self.surfaces))
         for kind, records in (("rotor", self.rotors), ("receiver", self.receivers), ("surface", self.surfaces)):
             names = [record.name for record in records]
@@ -228,7 +227,7 @@ class PoweredAeroData:
 
     @property
     def reference(self) -> AeroReference:
-        return AeroReference(area=self.area, span=self.span, cbar=self.cbar, mrp_xyz=self.mrp_xyz)
+        return AeroReference(area=self.area, span=self.span, cbar=self.cbar)
 
     def receiver(self, name) -> ReceiverData:
         return {receiver.name: receiver for receiver in self.receivers}[name]

@@ -90,13 +90,12 @@ COEFFICIENT_NAMES = tuple(field.name for field in fields(AeroCoefficients))
 
 @dataclass(frozen=True)
 class AeroReference:
-    """What the coefficients are normalised on and taken about: area ``S`` (m^2), span ``b`` and mean chord
-    ``cbar`` (m), the moment reference point ``mrp_xyz`` (body FLU, from the airframe origin)."""
+    """What the coefficients are normalised on: area ``S`` (m^2), span ``b`` and mean chord ``cbar`` (m).  They are
+    taken about the airframe origin, which is the moment reference point; the flow is read there too."""
 
     area: float
     span: float
     cbar: float
-    mrp_xyz: Position
 
 
 FRD_FROM_FLU = np.diag([1.0, -1.0, -1.0])

@@ -9,7 +9,6 @@ import numpy as np
 
 from rotorpy.vehicles.models.aero import AirframeState, flow_angles
 from rotorpy.vehicles.models.powered_aero.rotor import RotorWake
-from rotorpy.vehicles.models.powered_aero.splines import cross3
 
 if TYPE_CHECKING:
     from rotorpy.vehicles.models.powered_aero.model import PoweredAeroModel
@@ -67,7 +66,7 @@ def flight_diagnostics(model: PoweredAeroModel, state: AirframeState, q_alert_pa
       trips it, because there the freestream dynamic pressure is ~0.
     """
 
-    speed, alpha, beta = flow_angles(state.airspeed + cross3(state.w, model.data.mrp_xyz))
+    speed, alpha, beta = flow_angles(state.airspeed)
     qbar = 0.5 * model.data.rho * float(speed) ** 2
     alpha_deg, beta_deg = float(np.degrees(alpha)), float(np.degrees(beta))
     band = model.data.clean.trusted_alpha_deg
